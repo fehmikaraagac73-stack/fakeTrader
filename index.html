@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en" data-palette="classic">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<meta name="description" content="Paper Trader — a fake stock market simulator. No real money.">
+<title>Paper Trader</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%230b0d10'/%3E%3Cpath%20d='M5%2022%20L12%2014%20L17%2018%20L27%207'%20stroke='%2300d98a'%20stroke-width='3'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- ── Top bar ─────────────────────────────────────────── -->
+  <header class="topbar" id="topbar">
+    <div class="topbar-left">
+      <button class="icon-btn" id="backBtn" aria-label="Go back" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <div class="topbar-title" id="topbarTitle">Paper Trader</div>
+    </div>
+    <div class="topbar-right">
+      <div class="session-pill" id="sessionPill" title="Market session">
+        <span class="session-dot"></span><span id="sessionText">—</span>
+      </div>
+      <button class="icon-btn" id="settingsBtn" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 8.9 19a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 5 8.9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9.5a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Alert / news banners ────────────────────────────── -->
+  <div class="banner-stack" id="bannerStack" aria-live="polite"></div>
+
+  <!-- ── Main scroll view ────────────────────────────────── -->
+  <main class="view" id="view" tabindex="-1"></main>
+
+  <!-- ── Sticky action bar (stock detail) ────────────────── -->
+  <div class="action-bar" id="actionBar" hidden></div>
+
+  <!-- ── Bottom tab bar ──────────────────────────────────── -->
+  <nav class="tabbar" id="tabbar" aria-label="Primary">
+    <a class="tab" href="#/home" data-tab="home" aria-label="Home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+      <span>Home</span>
+    </a>
+    <a class="tab" href="#/search" data-tab="search" aria-label="Search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      <span>Search</span>
+    </a>
+    <a class="tab" href="#/portfolio" data-tab="portfolio" aria-label="Portfolio">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      <span>Portfolio</span>
+    </a>
+    <a class="tab" href="#/history" data-tab="history" aria-label="History">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg>
+      <span>History</span>
+    </a>
+    <a class="tab" href="#/notes" data-tab="notes" aria-label="Notes and alerts">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h11l4 4v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M15 4v5h5"/><path d="M8 13h7M8 17h5"/></svg>
+      <span>Notes</span>
+      <span class="tab-badge" id="notesBadge" hidden>0</span>
+    </a>
+  </nav>
+</div>
+
+<!-- ── Bottom sheet host ─────────────────────────────────── -->
+<div class="sheet-host" id="sheetHost" hidden>
+  <div class="sheet-scrim" id="sheetScrim"></div>
+  <section class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <div class="sheet-grab" id="sheetGrab"><span></span></div>
+    <div class="sheet-body" id="sheetBody"></div>
+  </section>
+</div>
+
+<!-- ── Toast host ────────────────────────────────────────── -->
+<div class="toast-host" id="toastHost" aria-live="polite"></div>
+
+<!-- ── Onboarding ────────────────────────────────────────── -->
+<div class="onboard" id="onboard" hidden>
+  <div class="onboard-card" role="dialog" aria-modal="true" aria-labelledby="obTitle">
+    <div class="onboard-logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8"/><path d="M5 22 L12 14 L17 18 L27 7" class="ol-line"/></svg>
+    </div>
+    <h1 id="obTitle">Paper Trader</h1>
+    <p class="onboard-lede">A stock market simulator. Every ticker, price, and headline in here is invented.</p>
+    <ul class="onboard-list">
+      <li><b>$10,000</b> in paper money to start — none of it is real.</li>
+      <li>Prices move on a simulated engine, not a live exchange.</li>
+      <li>Nothing here is financial advice or a real brokerage.</li>
+    </ul>
+    <button class="btn btn-primary btn-lg" id="onboardStart">Start with $10,000</button>
+  </div>
+</div>
+
+<span class="sr-only" id="srLive" aria-live="polite"></span>
+
+<script src="scripts.js"></script>
+</body>
+</html>
