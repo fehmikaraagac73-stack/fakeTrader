@@ -203,6 +203,16 @@ week of movement that "happened" while you were gone. Any limit or stop orders
 you left resting are checked against that period and filled if the price
 crossed them. You will see a banner telling you what filled while you were out.
 
+That applies to your own account as much as to the stock charts. The net worth
+line on Home and Portfolio is not a recording -- nothing about it is written
+down as you play. It is recalculated from your transaction history and the
+price engine every time you look at it, which means it can show what your
+portfolio was worth at any minute in the past, including every minute the app
+was shut. Leave for four days and you come back to four days of your account
+rising and falling, not a flat line with a single jump at the end. The chart
+has its own timeframe buttons -- 1D, 1W, 1M, 3M, 1Y and ALL -- for choosing how
+far back to look.
+
 Resetting your account in Settings generates a brand new seed, and therefore a
 completely different market.
 

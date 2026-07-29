@@ -340,6 +340,7 @@ function newsFor(sym, dn) {
 
 var dailyCache = null;       // sym -> [{t,o,h,l,c,v,dn}]
 var dailyBaseDn = 0;
+var dailyBuiltDn = null;     // the "today" this series was generated against
 
 function marketLogRet(dn) {
   var rng = streamFor([state.seed, 'market', dn]);
@@ -360,10 +361,21 @@ function dayLogRet(st, dn, price, anchor) {
   return { base: base, jump: news ? Math.log(1 + news.jump) : 0, news: news };
 }
 
+/* Regenerates the whole market from the seed.
+
+   This owns invalidating the intraday cache. That cache is keyed on
+   (ticker, day) with no seed and no base day in the key, so anything it still
+   holds after a reset — or after the 730-day window slides at midnight —
+   belongs to a market that no longer exists. Clearing here rather than at the
+   call sites makes it structural: every path that changes the market has to
+   come through this function anyway. */
 function buildDaily() {
   dailyCache = {};
+  intradayCache.clear();
+  nwSeriesCache = {};          // its cached bars priced the old market
   var today = dayNum(Date.now());
   dailyBaseDn = today - HISTORY_DAYS;
+  dailyBuiltDn = today;
 
   SYMBOLS.forEach(function (sym) {
     var st = STOCKS[sym];
@@ -399,6 +411,17 @@ function buildDaily() {
 
 function dailyBars(sym) { return dailyCache[sym]; }
 
+/* The daily series is generated relative to "today", so a session left open
+   across midnight is working from a stale one: yesterday never becomes
+   yesterday, every "today's change" is measured against a day-old reference
+   close, and the intraday cache keeps serving the previous day's walk.
+   Cheap enough to check on every tick. */
+function ensureFreshDay() {
+  if (dailyBuiltDn === dayNum(Date.now())) return false;
+  buildDaily();
+  return true;
+}
+
 /* Close of the day *before* dn — the reference for "today's change". */
 function closeBefore(sym, dn) {
   var bars = dailyCache[sym];
@@ -417,6 +440,20 @@ function closeBefore(sym, dn) {
 var intradayCache = new Map();      // "sym|dn" -> {closes, vols, dn, sym, full}
 var INTRADAY_CACHE_MAX = 400;
 
+/* The walk is a *bridge*, not a free run: it starts at the previous daily
+   close and is pinned to land exactly on this day's daily close.
+
+   Left free it only lands there on average — the accumulated noise is about
+   1.55x the daily volatility, so a day typically ended two or three percent
+   away from the daily bar that is supposed to describe it. Since the next
+   day's walk starts from that daily close, every midnight was a small gap: a
+   visible step in any chart that spans more than one day, and a phantom jump
+   in the net worth curve at 00:00 every night.
+
+   The residual is spread in proportion to session activity rather than evenly
+   across the clock, so the correction lands in the hours that are already
+   moving instead of imposing a slow drift through the flat overnight stretch.
+   The news jump stays a discrete step either way. */
 function buildIntradayCloses(sym, dn) {
   var st = STOCKS[sym];
   var prevClose = closeBefore(sym, dn);
@@ -429,16 +466,28 @@ function buildIntradayCloses(sym, dn) {
   var vrng = streamFor([state.seed, 'ivol', sym, dn]);
   var closes = new Float64Array(MINUTES_DAY);
   var vols = new Float64Array(MINUTES_DAY);
-  var p = prevClose;
+  var walk = new Float64Array(MINUTES_DAY);     // cumulative log return
+  var weight = new Float64Array(MINUTES_DAY);   // cumulative session activity
   var baseVol = st.baseVolume / 500;
+  var x = 0, w = 0, m, mult;
 
-  for (var m = 0; m < MINUTES_DAY; m++) {
-    var mult = sessionMult(dn, m);
+  for (m = 0; m < MINUTES_DAY; m++) {
+    mult = sessionMult(dn, m);
     var step = perMinDrift + sigma * mult * gauss(rng);
     if (r.news && m === r.news.minute) step += r.jump;
-    p = Math.max(MIN_PRICE, p * Math.exp(step));
-    closes[m] = p;
+    x += step;
+    w += mult;
+    walk[m] = x;
+    weight[m] = w;
     vols[m] = Math.round(baseVol * mult * (0.3 + vrng() * 1.7) * (1 + 45 * Math.abs(step)));
+  }
+
+  // Same (base, jump) the daily series used for this day — identical rng
+  // stream, identical anchor — so this target *is* the daily bar's close.
+  var resid = (r.base + r.jump) - walk[MINUTES_DAY - 1];
+  for (m = 0; m < MINUTES_DAY; m++) {
+    var share = w > 0 ? weight[m] / w : (m + 1) / MINUTES_DAY;
+    closes[m] = Math.max(MIN_PRICE, prevClose * Math.exp(walk[m] + resid * share));
   }
   return { sym: sym, dn: dn, closes: closes, vols: vols, prevClose: prevClose, news: r.news };
 }
@@ -618,7 +667,7 @@ var saveTimer = null;
 
 function freshState(seed) {
   return {
-    v: 1,
+    v: 2,
     seed: seed || (Math.floor(Math.random() * 4294967295) >>> 0),
     createdAt: Date.now(),
     lastSeen: Date.now(),
@@ -628,12 +677,12 @@ function freshState(seed) {
     history: [],              // executions & cancellations, newest last
     notes: [],
     watchlist: ['NVTX', 'MEDR', 'VNTR', 'SUNQ', 'LUXE', 'LNKV'],
-    snapshots: [],            // [{t, v}] net worth over time
     news: [],                 // seen headlines, newest last
     settings: {
       palette: 'classic',
       chartType: 'line',
-      timeframe: '1D',
+      timeframe: '1D',        // stock detail chart
+      nwTimeframe: '1W',      // net worth chart
       realism: false,         // bid/ask spread + slippage
       reducedMotion: false,
       haptics: true,
@@ -661,6 +710,10 @@ function load() {
     for (var k in base) if (!(k in s)) s[k] = base[k];
     s.settings = Object.assign({}, base.settings, s.settings || {});
     s.stats = Object.assign({}, base.stats, s.stats || {});
+    // v1 stored up to 4000 net worth samples. The curve is computed from the
+    // fill history now, so they are dead weight — drop them on first load.
+    delete s.snapshots;
+    s.v = base.v;
     return s;
   } catch (e) {
     console.warn('Save file unreadable, starting fresh.', e);
@@ -673,7 +726,6 @@ function save() {
   saveTimer = setTimeout(function () {
     saveTimer = null;
     try {
-      if (state.snapshots.length > 4000) state.snapshots = state.snapshots.slice(-4000);
       if (state.news.length > 200) state.news = state.news.slice(-200);
       localStorage.setItem(STORE_KEY, JSON.stringify(state));
     } catch (e) {
@@ -1128,14 +1180,6 @@ function recentNews(days, symFilter) {
   return out;
 }
 
-function snapshotNetWorth() {
-  var now = Date.now();
-  var last = state.snapshots[state.snapshots.length - 1];
-  if (last && now - last.t < 55000) return;
-  state.snapshots.push({ t: now, v: Math.round(netWorth() * 100) / 100 });
-  if (state.snapshots.length > 4000) state.snapshots = state.snapshots.slice(-4000);
-}
-
 function touchStreak() {
   var today = dayNum(Date.now());
   var last = state.stats.lastActiveDn;
@@ -1196,7 +1240,6 @@ function leaderboard() {
 
 /* Runs after any position/cash change. */
 function afterTrade() {
-  snapshotNetWorth();
   var earned = checkBadges();
   earned.forEach(function (b) {
     pushBanner('badge', 'Badge unlocked — ' + b.name, b.emoji + '  Keep going.');
@@ -2326,35 +2369,178 @@ function openNoteEditor(sym, existing) {
 
 /* ============================================================================
    18. NET WORTH SERIES
-   Snapshots are taken once a minute; this shapes them into chart bars.
+   The market runs whether or not the app is open, so the equity curve has to
+   be *computed*, not sampled.
+
+   Cash and share counts are a step function of the fill history. Prices are a
+   pure function of (seed, ticker, time). Put the two together and net worth at
+   any past instant is recoverable exactly — including every minute the app was
+   closed. That is the same trick `scanForFill` uses to settle resting orders
+   retroactively, applied to the portfolio as a whole.
+
+   This replaces stored snapshots, which sampled only while the tab happened to
+   be open. That gave a dense flat line for the session you were present for,
+   one vertical cliff per night or weekend away, and — because the chart spaces
+   points by index, not by time — an x-axis where three hours of Tuesday took up
+   more width than the following four days.
    ========================================================================== */
 
-function netWorthBars() {
-  var snaps = state.snapshots.slice();
-  if (!snaps.length || snaps[0].t > state.createdAt + 1000) {
-    snaps.unshift({ t: state.createdAt, v: START_CASH });
-  }
-  snaps.push({ t: Date.now(), v: netWorth() });
+var NW_TIMEFRAMES = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
+var NW_LABEL = {
+  '1D': 'today', '1W': 'past week', '1M': 'past month',
+  '3M': 'past 3 months', '1Y': 'past year', 'ALL': 'all time'
+};
+var NW_POINTS = 180;            // samples across the window, whatever its span
+var NW_FINE_MAX = 8 * DAY_MS;   // above this, sample daily closes instead
 
-  // Keep the line readable regardless of how long the run has been going.
-  var MAXP = 180;
-  if (snaps.length > MAXP) {
-    var step = snaps.length / MAXP;
-    var thin = [];
-    for (var i = 0; i < MAXP; i++) thin.push(snaps[Math.floor(i * step)]);
-    thin.push(snaps[snaps.length - 1]);
-    snaps = thin;
+/* ── Position replay ──────────────────────────────────────────────────────
+   Checkpoints of {cash, pos} in timestamp order. Between two checkpoints the
+   portfolio is constant and only prices move, which is what makes valuing an
+   arbitrary instant a single lookup. */
+
+var timelineCache = null;
+var timelineKey = '';
+var nwSeriesCache = {};   // timeframe -> {key, bars}
+
+function portfolioTimeline() {
+  var key = state.createdAt + '|' + state.history.length + '|' + state.cash;
+  if (timelineCache && timelineKey === key) return timelineCache;
+
+  // Sorted by ts, not by insertion order: retroactive fills are appended when
+  // they are *discovered*, which can be well after the minute they happened.
+  var fills = state.history.filter(function (h) { return h.status === 'filled'; })
+                           .sort(function (a, b) { return a.ts - b.ts; });
+
+  var cash = START_CASH, pos = {};
+  var pts = [{ t: state.createdAt, cash: cash, pos: pos }];
+
+  for (var i = 0; i < fills.length; i++) {
+    var f = fills[i];
+    var qty = Number(f.qty) || 0;
+    var total = Number(f.total) || 0;
+    pos = Object.assign({}, pos);                 // checkpoints must not alias
+    var held = (pos[f.ticker] || 0) + (f.side === 'buy' ? qty : -qty);
+    cash += f.side === 'buy' ? -total : total;
+    if (held <= 1e-9) delete pos[f.ticker]; else pos[f.ticker] = held;
+    // Clamp forward so the series stays monotonic even if a save has a stray ts.
+    pts.push({ t: Math.max(f.ts, pts[pts.length - 1].t), cash: cash, pos: pos });
+  }
+
+  // The last leg is the live portfolio rather than the replay's opinion of it,
+  // so the chart's final point equals the hero number to the cent. With intact
+  // history the two are already identical; this just makes it a guarantee.
+  var tail = pts[pts.length - 1];
+  var live = {};
+  heldSymbols().forEach(function (s) { live[s] = state.positions[s].shares; });
+  tail.cash = state.cash;
+  tail.pos = live;
+
+  timelineCache = pts;
+  timelineKey = key;
+  return pts;
+}
+
+/* ── Historic prices ──────────────────────────────────────────────────────
+   Minute closes come straight out of the intraday walk, which is already LRU
+   cached per (ticker, day). The sub-minute Brownian bridge is only worth
+   paying for at the live edge, where it is what makes the last point crawl. */
+
+function priceAtMinute(sym, ts) {
+  var now = Date.now();
+  if (ts >= now - 30000) return livePrice(sym, Math.min(ts, now));
+  var dn = dayNum(ts);
+  if (dn > dayNum(now)) return livePrice(sym);
+  return intradayFor(sym, dn).closes[clamp(minuteOfDay(ts), 0, MINUTES_DAY - 1)];
+}
+
+/* Coarse windows read the daily walk — one array lookup instead of building a
+   1440-minute series for every day on screen. */
+function priceAtDay(sym, ts) {
+  var bars = dailyCache[sym];
+  var i = dayNum(ts) - dailyBaseDn;
+  if (i < 0) return STOCKS[sym].p0;
+  if (i >= bars.length) return livePrice(sym);    // today has no daily bar yet
+  return bars[i].c;
+}
+
+/* ── The series ─────────────────────────────────────────────────────────── */
+
+function nwWindow(tf) {
+  var now = Date.now();
+  var span = { '1W': 7 * DAY_MS, '1M': 30 * DAY_MS, '3M': 91 * DAY_MS, '1Y': 365 * DAY_MS }[tf];
+  var from;
+  if (tf === '1D') from = startOfDay(now);
+  else if (span) from = now - span;
+  else from = state.createdAt;                    // ALL
+  from = Math.max(from, state.createdAt);
+  if (now - from < 60000) from = now - 60000;     // a minutes-old account still draws a line
+  return { from: from, to: now };
+}
+
+/* Uniformly spaced in *time*, which is what makes the chart's index-based
+   x-axis honest: one step of the grid is one step across the canvas. */
+function netWorthSeries(tf) {
+  var win = nwWindow(tf);
+  var span = win.to - win.from;
+  var coarse = span > NW_FINE_MAX;
+  var unit = coarse ? DAY_MS : 60000;
+  var step = Math.max(unit, Math.ceil(span / NW_POINTS / unit) * unit);
+
+  // Anchor the grid to absolute step boundaries instead of to "now". A window
+  // measured backwards from the current instant slides on every tick, so every
+  // point lands somewhere new and the whole series — and every intraday walk
+  // behind it — has to be rebuilt twice a second. Anchored, the grid only
+  // advances when a boundary is crossed, so between those the repaint is just
+  // the live point moving.
+  var first = Math.ceil(win.from / step) * step;
+  var tl = portfolioTimeline();
+  var key = tf + '|' + timelineKey + '|' + first + '|' + step + '|' + Math.floor(win.to / step);
+
+  var cached = nwSeriesCache[tf];
+  if (cached && cached.key === key) {
+    liveTail(cached.bars, tl, win.to, coarse);
+    return cached.bars;
   }
 
   var bars = [];
-  for (var j = 0; j < snaps.length; j++) {
-    var prev = j === 0 ? snaps[0].v : snaps[j - 1].v;
-    bars.push({
-      t: snaps[j].t, o: prev, c: snaps[j].v,
-      h: Math.max(prev, snaps[j].v), l: Math.min(prev, snaps[j].v), v: 0
-    });
+  var cur = 0;
+  var prev = null;
+
+  for (var t = first; t < win.to; t += step) {
+    while (cur + 1 < tl.length && tl[cur + 1].t <= t) cur++;
+    var v = valueAt(tl[cur], t, coarse);
+    var o = prev === null ? v : prev;
+    bars.push({ t: t, o: o, c: v, h: Math.max(o, v), l: Math.min(o, v), v: 0 });
+    prev = v;
   }
+
+  // The live point always closes the series, so the chart ends on the same
+  // number the hero prints.
+  var lv = valueAt(tl[tl.length - 1], win.to, coarse);
+  var lo = prev === null ? lv : prev;
+  bars.push({ t: win.to, o: lo, c: lv, h: Math.max(lo, lv), l: Math.min(lo, lv), v: 0 });
+
+  nwSeriesCache[tf] = { key: key, bars: bars };
   return bars;
+}
+
+/* Value one checkpoint's holdings at an instant. */
+function valueAt(ck, ts, coarse) {
+  var v = ck.cash;
+  for (var sym in ck.pos) {
+    v += ck.pos[sym] * (coarse ? priceAtDay(sym, ts) : priceAtMinute(sym, ts));
+  }
+  return v;
+}
+
+/* Re-price only the trailing point of a cached series. */
+function liveTail(bars, tl, to, coarse) {
+  var last = bars[bars.length - 1];
+  var v = valueAt(tl[tl.length - 1], to, coarse);
+  last.t = to;
+  last.c = v;
+  last.h = Math.max(last.o, v);
+  last.l = Math.min(last.o, v);
 }
 
 /* A chart block with a heading readout that follows the crosshair. */
@@ -2386,6 +2572,78 @@ function chartBlock(opts) {
   return { wrap: wrap, chart: chart, canvas: canvas };
 }
 
+/* The equity curve, timeframe strip and all. Home and Portfolio both mount one
+   of these, so the two can never disagree about your own account.
+
+   `onChange` fires after every repaint and every crosshair move; the host uses
+   it to keep its hero number in step with what the chart is showing. */
+function netWorthChart(opts) {
+  opts = opts || {};
+  var wrap = el('div');
+  var tf = state.settings.nwTimeframe || '1W';
+  if (NW_TIMEFRAMES.indexOf(tf) === -1) tf = '1W';
+
+  var cb = chartBlock({ volume: false, baseline: true });
+  wrap.appendChild(cb.wrap);
+
+  var strip = el('div', { class: 'tf-strip' });
+  NW_TIMEFRAMES.forEach(function (t) {
+    var b = el('button', { type: 'button', text: t, 'aria-label': 'Net worth over the ' + NW_LABEL[t] });
+    b.setAttribute('aria-pressed', String(tf === t));
+    b.addEventListener('click', function () {
+      tf = t;
+      state.settings.nwTimeframe = t;
+      save();
+      $$('button', strip).forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+      paint();
+      haptic(6);
+    });
+    strip.appendChild(b);
+  });
+  wrap.appendChild(strip);
+
+  var bars = [];
+  var scrubbed = null;
+  var baseScrub = cb.chart.onScrub;
+  cb.chart.onScrub = function (bar) {
+    baseScrub(bar);
+    scrubbed = bar;
+    if (opts.onChange) opts.onChange(api);
+  };
+
+  function paint() {
+    bars = netWorthSeries(tf);
+    cb.chart.setData(bars, 'line');
+    // Repainting under a held finger must re-read the point the crosshair is
+    // on, not keep quoting the bar object from the previous series.
+    var si = cb.chart.scrubIndex;
+    scrubbed = (si >= 0 && si < bars.length) ? bars[si] : null;
+    cb.canvas.setAttribute('aria-label', chartSummary(bars, 'Net worth, ' + NW_LABEL[tf]));
+    var up = bars.length && bars[bars.length - 1].c >= bars[0].o;
+    strip.style.setProperty('--tf-color', up ? cssVar('--pos') : cssVar('--neg'));
+    strip.style.setProperty('--tf-bg', up ? cssVar('--pos-soft') : cssVar('--neg-soft'));
+    if (opts.onChange) opts.onChange(api);
+  }
+
+  var api = {
+    wrap: wrap,
+    paint: paint,
+    timeframe: function () { return tf; },
+    label: function () { return NW_LABEL[tf]; },
+    scrubbed: function () { return scrubbed; },
+    /* What the hero should read: the point under the crosshair, else live. */
+    shown: function () { return scrubbed ? scrubbed.c : netWorth(); },
+    /* Change across the visible window, which is the move the line draws. */
+    periodChange: function () {
+      if (!bars.length) return { abs: 0, pct: 0 };
+      var from = bars[0].o;
+      var to = scrubbed ? scrubbed.c : bars[bars.length - 1].c;
+      return { abs: to - from, pct: from > 0 ? ((to - from) / from) * 100 : 0 };
+    }
+  };
+  return api;
+}
+
 /* ============================================================================
    19. VIEW — HOME
    ========================================================================== */
@@ -2404,45 +2662,32 @@ function viewHome() {
   frag.appendChild(hero);
 
   // ── Net worth chart ───────────────────────────────────────────────────────
-  var cb = chartBlock({ volume: false, baseline: true });
-  frag.appendChild(cb.wrap);
-
-  var scrubbed = null;
-  var baseOnScrub = cb.chart.onScrub;
-  cb.chart.onScrub = function (bar) {
-    baseOnScrub(bar);
-    scrubbed = bar;
-    paintHero();
-  };
+  var nwc = netWorthChart({ onChange: function () { paintHero(); } });
+  frag.appendChild(nwc.wrap);
 
   function paintHero() {
-    var nw = netWorth();
-    var shown = scrubbed ? scrubbed.c : nw;
+    var shown = nwc.shown();
     nwEl.textContent = money(shown);
 
-    var tpl = todayPL();
+    // The delta describes the line on screen, so the two always agree.
+    var per = nwc.periodChange();
     var tot = totalReturn();
+    var sb = nwc.scrubbed();
     deltaEl.innerHTML = '';
-    if (scrubbed) {
-      var base = START_CASH;
-      var ch = shown - base;
-      deltaEl.appendChild(el('span', { class: toneOf(ch), text: signedMoney(ch) + ' (' + signedPct((ch / base) * 100) + ')' }));
-      deltaEl.appendChild(el('span', { class: 'sub', text: 'since start' }));
+    deltaEl.appendChild(el('span', { class: toneOf(per.abs), text: signedMoney(per.abs) + ' (' + signedPct(per.pct) + ')' }));
+    if (sb) {
+      deltaEl.appendChild(el('span', { class: 'sub', text: fmtDayHeading(sb.t) + ' ' + fmtTime(sb.t) }));
     } else {
-      deltaEl.appendChild(el('span', { class: toneOf(tpl), text: signedMoney(tpl) + ' today' }));
-      deltaEl.appendChild(el('span', { class: 'sub', text: '·' }));
-      deltaEl.appendChild(el('span', { class: toneOf(tot.abs), text: signedMoney(tot.abs) + ' (' + signedPct(tot.pct) + ') all time' }));
+      deltaEl.appendChild(el('span', { class: 'sub', text: nwc.label() }));
+      if (nwc.timeframe() !== 'ALL') {
+        deltaEl.appendChild(el('span', { class: 'sub', text: '·' }));
+        deltaEl.appendChild(el('span', { class: toneOf(tot.abs), text: signedMoney(tot.abs) + ' (' + signedPct(tot.pct) + ') all time' }));
+      }
     }
-    nwEl.setAttribute('aria-label', 'Net worth ' + money(nw));
+    nwEl.setAttribute('aria-label', 'Net worth ' + money(netWorth()));
   }
-
-  function paintChart() {
-    var bars = netWorthBars();
-    cb.chart.setData(bars, 'line');
-    cb.canvas.setAttribute('aria-label', chartSummary(bars, 'Net worth'));
-  }
-  paintHero(); paintChart();
-  onViewTick(function () { paintHero(); paintChart(); });
+  nwc.paint();                       // paints the chart, which paints the hero
+  onViewTick(function () { nwc.paint(); });
 
   // ── Buying power ──────────────────────────────────────────────────────────
   var bpCard = el('div', { class: 'card', style: 'padding:6px 16px' });
@@ -2976,33 +3221,29 @@ function viewPortfolio() {
   hero.appendChild(nwEl); hero.appendChild(dEl);
   frag.appendChild(hero);
 
-  var cb = chartBlock({ volume: false, baseline: true });
-  frag.appendChild(cb.wrap);
-  var scrubbed = null;
-  var base = cb.chart.onScrub;
-  cb.chart.onScrub = function (bar) { base(bar); scrubbed = bar; paintHero(); };
+  var nwc = netWorthChart({ onChange: function () { paintHero(); } });
+  frag.appendChild(nwc.wrap);
 
   function paintHero() {
-    var nw = netWorth();
-    var shown = scrubbed ? scrubbed.c : nw;
+    var shown = nwc.shown();
     nwEl.textContent = money(shown);
-    var tot = { abs: shown - START_CASH, pct: ((shown - START_CASH) / START_CASH) * 100 };
-    var tp = todayPL();
+    var per = nwc.periodChange();
+    var tot = totalReturn();
+    var sb = nwc.scrubbed();
     dEl.innerHTML = '';
-    dEl.appendChild(el('span', { class: toneOf(tot.abs), text: signedMoney(tot.abs) + ' (' + signedPct(tot.pct) + ')' }));
-    dEl.appendChild(el('span', { class: 'sub', text: scrubbed ? fmtDate(scrubbed.t) + ' ' + fmtTime(scrubbed.t) : 'all time' }));
-    if (!scrubbed) {
-      dEl.appendChild(el('span', { class: 'sub', text: '·' }));
-      dEl.appendChild(el('span', { class: toneOf(tp), text: signedMoney(tp) + ' today' }));
+    dEl.appendChild(el('span', { class: toneOf(per.abs), text: signedMoney(per.abs) + ' (' + signedPct(per.pct) + ')' }));
+    if (sb) {
+      dEl.appendChild(el('span', { class: 'sub', text: fmtDate(sb.t) + ' ' + fmtTime(sb.t) }));
+    } else {
+      dEl.appendChild(el('span', { class: 'sub', text: nwc.label() }));
+      if (nwc.timeframe() !== 'ALL') {
+        dEl.appendChild(el('span', { class: 'sub', text: '·' }));
+        dEl.appendChild(el('span', { class: toneOf(tot.abs), text: signedMoney(tot.abs) + ' all time' }));
+      }
     }
   }
-  function paintChart() {
-    var bars = netWorthBars();
-    cb.chart.setData(bars, 'line');
-    cb.canvas.setAttribute('aria-label', chartSummary(bars, 'Net worth'));
-  }
-  paintHero(); paintChart();
-  onViewTick(function () { paintHero(); paintChart(); });
+  nwc.paint();
+  onViewTick(function () { nwc.paint(); });
 
   // ── Breakdown ─────────────────────────────────────────────────────────────
   frag.appendChild(sectionHead('Account'));
@@ -3016,6 +3257,10 @@ function viewPortfolio() {
     if (reservedCash() > 0.005) acct.appendChild(kv('Reserved for open orders', money(reservedCash())));
     acct.appendChild(kv('Holdings value', money(holdingsValue())));
     acct.appendChild(kv('Net worth', money(netWorth())));
+    // Holdings marked against yesterday's close — distinct from the chart's
+    // period change, which also counts money moved in and out today.
+    var tp = todayPL();
+    acct.appendChild(kv('Holdings move today', signedMoney(tp), toneOf(tp)));
     acct.appendChild(kv('Unrealized P/L', signedMoney(un), toneOf(un)));
     acct.appendChild(kv('Realized P/L', signedMoney(re), toneOf(re)));
     acct.appendChild(kv('Total return', signedMoney(totalReturn().abs) + '  ' + signedPct(totalReturn().pct), toneOf(totalReturn().abs)));
@@ -3658,8 +3903,7 @@ function openSettings() {
         var keep = { palette: state.settings.palette, reducedMotion: state.settings.reducedMotion, haptics: state.settings.haptics, realism: state.settings.realism };
         state = freshState();
         state.settings = Object.assign(state.settings, keep, { onboarded: true });
-        intradayCache.clear();
-        buildDaily();
+        buildDaily();                       // also clears the intraday cache
         saveNow();
         applySettings();
         toast('Fresh start — ' + money(START_CASH) + ' in paper money', 'good');
@@ -3817,6 +4061,10 @@ function tick() {
   if (document.hidden) return;
   var now = Date.now();
 
+  // A tab left open overnight has to roll into the new day before anything
+  // below reads a price.
+  var rolled = ensureFreshDay();
+
   // Settle anything that crossed its trigger since the last tick.
   var fills = processRestingOrders(state.lastSeen, now);
   fills.forEach(function (f) {
@@ -3839,7 +4087,6 @@ function tick() {
   pumpNews();
 
   state.lastSeen = now;
-  snapshotNetWorth();
   updateSessionPill();
   updateNotesBadge();
 
@@ -3847,7 +4094,7 @@ function tick() {
   viewTicks.forEach(function (fn) { try { fn(); } catch (e) { console.warn(e); } });
   sheetTicks.forEach(function (fn) { try { fn(); } catch (e) { console.warn(e); } });
 
-  if (fills.length || alerts.length) { save(); rerender(); }
+  if (fills.length || alerts.length || rolled) { save(); rerender(); }
   else if (++tickCount % 30 === 0) save();
 }
 
@@ -3858,6 +4105,7 @@ function tick() {
 function catchUp() {
   var now = Date.now();
   var away = now - state.lastSeen;
+  ensureFreshDay();                 // the market may have rolled while away
   var fills = processRestingOrders(state.lastSeen, now);
   state.lastSeen = now;
   lastNewsMinute = minuteOfDay(now);
@@ -3880,7 +4128,6 @@ function catchUp() {
     pushBanner('news', 'Welcome back',
       'The market kept moving. You are at ' + money(netWorth()) + ' — ' + signedPct(tot.pct) + ' all time.');
   }
-  snapshotNetWorth();
   save();
 }
 
@@ -3937,7 +4184,6 @@ function init() {
       state.settings.onboarded = true;
       state.createdAt = Date.now();
       state.lastSeen = Date.now();
-      state.snapshots = [{ t: Date.now(), v: START_CASH }];
       saveNow();
       ob.hidden = true;
       boot();
