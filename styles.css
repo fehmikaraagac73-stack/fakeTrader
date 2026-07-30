@@ -189,7 +189,7 @@ ul, ol { list-style: none; }
   bottom: calc(var(--tabbar-h) + var(--sab));
   display: flex; gap: 10px;
   padding: 10px calc(14px + var(--sar)) 10px calc(14px + var(--sal));
-  background: rgba(11, 13, 16, .93);
+  background: rgba(15, 18, 22, 0.93);
   backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
   border-top: 1px solid var(--line-soft);
 }
